@@ -1,25 +1,23 @@
 // Surge Rider — a paper trading bot for the pump.fun replay (agent-fun/replay/v2).
 //
-// Idea: most new pump.fun coins die fast, but the ones that catch a real bid keep
-// climbing for a while. This bot waits for a coin to show a genuine surge — several
-// different wallets buying, net SOL flowing in, price climbing and holding near its
-// recent high — then rides it with a fixed stake and a hard exit plan. It never
-// chases a coin that already ran away inside one window, never buys a curve that
-// is too thin to absorb the order, and never re-enters a coin it already traded.
+// Idea: a pump.fun launch that catches a real bid pops in its first seconds, and
+// most of the coins that die do so just as fast. This bot buys launches, not
+// runners: within 10 slots of a coin's CreateEvent it checks the opening tape —
+// the creator must not have sold, at least two other wallets must have bought
+// in, no single sell may have dumped yet, and the price must not already have
+// spiked — then takes a small 0.1 SOL stake and gets out fast (quick take-profit,
+// tight stop, short trailing stop, hard time limit). Losers are cut before they
+// can bleed the book; the rare launch that keeps climbing is ridden by the trail.
 //
 // Every decision is a pure function of the batch stream: no clock, no randomness,
 // iteration only over insertion-ordered maps, so two runs agree byte for byte.
-//
-// Exits: take profit at +40% over cost, stop loss at -28%, a trailing stop once the
-// position is up 12% (sell if it gives back 18% from its peak), a fade exit when
-// sellers take over while the position is under water, and a hard time limit.
 //
 // Guardrail sweeper: the run must end with round trips on at least 20 coins. If
 // the bot's own filled round trips lag the pace of the 24h window, it opens tiny
 // probe round trips on liquid coins so the entry stays above the bar even on a
 // quiet window. Probes are small (0.03 SOL) and at most one is open at a time.
 
-import { LAMPORTS_PER_SOL, runBot, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
+import { runBot, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 
 const LAMPORTS = 1_000_000_000;
 // Curve fee (protocol + creator) charged on each side of a trade, as a fraction.
@@ -29,41 +27,33 @@ const WINDOW_SECS = 86_400;
 
 // --- tunables ---------------------------------------------------------------
 
-// Entry window, in slots.
-const LOOKBACK = 48;
-// Minimum net SOL (buys minus sells) inside the window.
-const MIN_NET_SOL = 0.4;
-// Minimum buy trades and distinct buying wallets inside the window.
-const MIN_BUYS = 3;
-const MIN_BUYERS = 3;
-// Buys must be at least this share of the window's traded SOL.
-const MIN_BUY_SHARE = 0.6;
-// Price rise inside the window, as a fraction: at least this, at most this.
-const MIN_RISE = 0.03;
-const MAX_RISE = 0.9;
-// Price must sit within this fraction of the window high.
-const NEAR_HIGH = 0.97;
+// Oldest age (slots since CreateEvent) at which a first buy may be decided.
+const MAX_ENTRY_AGE = 4;
+// Distinct non-creator wallets that must have bought before entry.
+const MIN_BUYERS = 4;
+// Largest single sell tolerated before entry, in SOL.
+const MAX_EARLY_SELL_SOL = 1.0;
+// Price run-up from the create price tolerated at entry, as a fraction.
+const MAX_RUNUP = 0.1;
 // Real SOL reserve bounds at entry.
-const MIN_REAL_SOL = 1.5;
-const MAX_REAL_SOL = 90;
-// Slots after a CreateEvent before the coin may be bought.
-const MIN_AGE_SLOTS = 240;
+const MIN_REAL_SOL = 0.3;
+const MAX_REAL_SOL = 30;
 // SOL per position, most positions open at once, most SOL at cost at once.
-const STAKE_SOL = 0.5;
+const STAKE_SOL = 0.1;
 const MAX_POSITIONS = 5;
 const MAX_EXPOSURE_SOL = 6;
 // Slippage allowed on buys (bps). Sells go out wide open so they always land.
-const BUY_SLIPPAGE_BPS = 2000;
+const BUY_SLIPPAGE_BPS = 10_000;
 // Exits, as fractions of cost / peak value.
-const TAKE_PROFIT = 0.4;
-const STOP_LOSS = 0.28;
-const TRAIL_ARM = 0.12;
-const TRAIL_GIVEBACK = 0.18;
+const TAKE_PROFIT = 0.25;
+const STOP_LOSS = 0.08;
+const TRAIL_ARM = 0.1;
+const TRAIL_GIVEBACK = 0.1;
 // Fade exit: net SOL over this many slots below this while under water.
 const FADE_SLOTS = 24;
 const FADE_NET_SOL = -0.8;
 // Hard time limit, in slots held.
-const MAX_HOLD_SLOTS = 1800;
+const MAX_HOLD_SLOTS = 40;
 // Sweeper: target round-tripped coins by the end of the window, probe size.
 const TARGET_COINS = 30;
 const PROBE_SOL = 0.03;
@@ -80,6 +70,14 @@ interface TapeTrade {
 
 interface Tape {
   createdSlot: number | null;
+  creator: string | null;
+  createPrice: number;
+  /** The creator sold some of their own allocation already. */
+  devSold: boolean;
+  /** Distinct non-creator wallets that bought. */
+  buyers: Set<string>;
+  /** Largest single sell seen so far, in SOL. */
+  maxSellSol: number;
   trades: TapeTrade[];
   entered: boolean;
   probeDone: boolean;
@@ -98,7 +96,6 @@ const open = new Map<Pubkey, OpenPosition>();
 const probes = new Map<Pubkey, boolean>();
 // Coins the bot has round-tripped (a buy fill and a later sell fill).
 const roundTripped = new Set<Pubkey>();
-const boughtCoins = new Set<Pubkey>();
 let myFills = 0;
 let firstBlockTime: number | null = null;
 let lastBlockTime: number | null = null;
@@ -106,7 +103,17 @@ let lastBlockTime: number | null = null;
 function tapeOf(mint: Pubkey): Tape {
   let t = tapes.get(mint);
   if (t === undefined) {
-    t = { createdSlot: null, trades: [], entered: false, probeDone: false };
+    t = {
+      createdSlot: null,
+      creator: null,
+      createPrice: 0,
+      devSold: false,
+      buyers: new Set<string>(),
+      maxSellSol: 0,
+      trades: [],
+      entered: false,
+      probeDone: false,
+    };
     tapes.set(mint, t);
   }
   return t;
@@ -140,40 +147,18 @@ function netFlow(t: Tape, now: number, slots: number): number {
 }
 
 /**
- * The surge test: is this coin, right now, catching a real bid?
- * Reads only the tape inside the lookback window.
+ * The launch test: is this coin, right now, a clean young launch worth a small
+ * stake? Reads only the opening tape: age, creator behaviour, early buyers,
+ * early dumps and the run-up from the create price.
  */
-function surging(t: Tape, now: number, realSol: number): boolean {
+function cleanLaunch(t: Tape, now: number, realSol: number, price: number): boolean {
+  if (t.createdSlot === null) return false;
+  if (now - t.createdSlot > MAX_ENTRY_AGE) return false;
+  if (t.devSold) return false;
+  if (t.buyers.size < MIN_BUYERS) return false;
+  if (t.maxSellSol >= MAX_EARLY_SELL_SOL) return false;
   if (realSol < MIN_REAL_SOL || realSol > MAX_REAL_SOL) return false;
-  if (t.createdSlot === null || now - t.createdSlot < MIN_AGE_SLOTS) return false;
-  const from = now - LOOKBACK;
-  let buySol = 0;
-  let sellSol = 0;
-  let buys = 0;
-  let firstPrice = -1;
-  let lastPrice = 0;
-  let high = 0;
-  const buyers = new Set<string>();
-  for (const tr of t.trades) {
-    if (tr.slot <= from) continue;
-    if (firstPrice < 0) firstPrice = tr.price;
-    if (tr.buy) {
-      buySol += tr.sol;
-      buys++;
-      buyers.add(tr.user);
-    } else {
-      sellSol += tr.sol;
-    }
-    if (tr.price > high) high = tr.price;
-    lastPrice = tr.price;
-  }
-  if (buys < MIN_BUYS || buyers.size < MIN_BUYERS) return false;
-  if (buySol - sellSol < MIN_NET_SOL) return false;
-  if (buySol < MIN_BUY_SHARE * (buySol + sellSol)) return false;
-  if (firstPrice <= 0 || lastPrice <= 0) return false;
-  const rise = lastPrice / firstPrice - 1;
-  if (rise < MIN_RISE || rise > MAX_RISE) return false;
-  if (lastPrice < high * NEAR_HIGH) return false;
+  if (t.createPrice > 0 && price > t.createPrice * (1 + MAX_RUNUP)) return false;
   return true;
 }
 
@@ -188,7 +173,6 @@ await runBot({
     for (const f of batch.fills) {
       if (f.status === 'filled' && !f.client_id.startsWith('_')) {
         myFills++;
-        boughtCoins.add(f.mint);
         if (f.side === 'sell') roundTripped.add(f.mint);
       }
     }
@@ -201,21 +185,28 @@ await runBot({
         if (lastBlockTime === null || e.block_time > lastBlockTime) lastBlockTime = e.block_time;
       }
       if (e.event === 'CreateEvent') {
-        tapeOf(e.mint).createdSlot = e.slot;
+        const t = tapeOf(e.mint);
+        t.createdSlot = e.slot;
+        t.creator = e.creator;
+        t.createPrice = priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
       } else if (e.event === 'TradeEvent') {
         const t = tapeOf(e.mint);
+        const sol = Number(e.sol_amount) / LAMPORTS;
+        if (!e.is_buy && sol > t.maxSellSol) t.maxSellSol = sol;
+        if (t.creator !== null && e.user === t.creator && !e.is_buy) t.devSold = true;
+        if (e.is_buy && (t.creator === null || e.user !== t.creator)) t.buyers.add(e.user);
         t.trades.push({
           slot: e.slot,
           buy: e.is_buy,
-          sol: Number(e.sol_amount) / LAMPORTS,
+          sol,
           user: e.user,
           price: priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)),
         });
         traded.add(e.mint);
       }
     }
-    // Prune tapes for coins that traded, keeping a little more than the lookback.
-    const keepFrom = now - LOOKBACK - 10;
+    // Prune tapes for coins that traded, keeping a little more than the fade window.
+    const keepFrom = now - FADE_SLOTS - 10;
     for (const mint of traded) {
       const t = tapes.get(mint)!;
       let cut = 0;
@@ -278,7 +269,7 @@ await runBot({
       if (!selling) probes.set(mint, true);
     }
 
-    // --- entries: surge riders, then the guardrail sweeper.
+    // --- entries: clean young launches, then the guardrail sweeper.
     let freeSol = Number(state.freeCashLamports()) / LAMPORTS;
     const txSol = Number(txFee) / LAMPORTS;
     let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
@@ -298,7 +289,8 @@ await runBot({
       const tape = tapes.get(mint)!;
       if (tape.entered) continue;
       const realSol = Number(curve.real_quote_reserves) / LAMPORTS;
-      if (!surging(tape, now, realSol)) continue;
+      const price = priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves);
+      if (!cleanLaunch(tape, now, realSol, price)) continue;
       const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
       let amount = Math.min(capSol, STAKE_SOL, MAX_EXPOSURE_SOL - exposureSol);
       if (amount > freeSol - txSol) amount = freeSol - txSol;

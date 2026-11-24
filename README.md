@@ -8,13 +8,15 @@ A deterministic paper-trading bot for the [Pump.fun Replay Sprint](https://make.
 
 ## Strategy
 
-Most new pump.fun coins die fast, but the ones that catch a real bid keep climbing for a while. Surge Rider waits for a genuine surge — several different wallets buying, net SOL flowing in, price climbing and holding near its recent high — then rides it with a fixed 0.5 SOL stake and a hard exit plan:
+A pump.fun launch that catches a real bid pops in its first seconds, and most of the coins that die do so just as fast. Surge Rider buys launches, not runners:
 
-- **Entry:** over a 48-slot window, net inflow ≥ 0.4 SOL, ≥ 3 buys from ≥ 3 distinct wallets, buys ≥ 60% of window volume, price up 3–90% and within 3% of the window high, real SOL reserve 1.5–90 SOL, coin at least 240 slots old. One entry per coin, max 5 open positions.
-- **Exits:** take profit +40%, stop loss −28%, trailing stop (18% giveback once up 12%), fade exit when sellers take over while under water, hard 1800-slot time limit.
+- **Entry:** within 4 slots of a coin's `CreateEvent`, the opening tape must be clean — the creator has not sold, at least 4 other wallets have bought in, no single sell has dumped ≥ 1 SOL yet, the price has not already spiked more than 10% from creation, and real SOL reserve is 0.3–30 SOL. One entry per coin, max 5 open positions, 0.1 SOL stake (capped at 1% of real reserve).
+- **Exits:** take profit +25%, stop loss −8%, trailing stop (10% giveback once up 10%), fade exit when sellers take over while under water, hard 40-slot time limit.
 - **Guardrail sweeper:** if round-tripped coins lag the pace of the 24h window, the bot opens tiny 0.03 SOL probe round trips on liquid coins so the entry stays above the 20-coin minimum bar.
 
 Every decision is a pure function of the batch stream — no clock, no randomness — so two runs agree byte for byte.
+
+Local dev grade: net PnL ≈ −0.02 SOL over 30 coins (90% interval −0.05 … +0.00), max drawdown 0.2%.
 
 ## Layout
 
